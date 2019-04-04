@@ -6,11 +6,12 @@
 import subprocess
 import threading
 import xml.etree.ElementTree as et
+import psutil
 
 from bases.collection import find_binary
 from bases.FrameworkServices.SimpleService import SimpleService
 
-disabled_by_default = True
+disabled_by_default = False
 
 
 NVIDIA_SMI = 'nvidia-smi'
@@ -31,6 +32,7 @@ TEMPERATURE = 'temperature'
 CLOCKS = 'clocks'
 POWER = 'power'
 PROCESSES_MEM = 'processes_mem'
+USERS_MEM = 'users_mem'
 
 ORDER = [
     PCI_BANDWIDTH,
@@ -43,6 +45,7 @@ ORDER = [
     CLOCKS,
     POWER,
     PROCESSES_MEM,
+    USERS_MEM,
 ]
 
 
@@ -112,6 +115,10 @@ def gpu_charts(gpu):
         },
         PROCESSES_MEM: {
             'options': [None, 'Memory Used by Each Process', 'MiB', fam, 'nvidia_smi.processes_mem', 'stacked'],
+            'lines': []
+        },
+        USERS_MEM: {
+            'options': [None, 'Memory Used by Each User', 'MiB', fam, 'nvidia_smi.users_mem', 'stacked'],
             'lines': []
         },
     }
@@ -304,10 +311,13 @@ class GPU:
         p_nodes = self.root.find('processes').findall('process_info')
         ps = []
         for p in p_nodes:
+            pid = int(p.find('pid').text)
+            process = psutil.Process(pid=pid)
             ps.append({
-                'pid': p.find('pid').text,
+                'pid': pid,
                 'process_name': p.find('process_name').text,
                 'used_memory': int(p.find('used_memory').text.split()[0]),
+                'user': process.username()
             })
         return ps
 
@@ -331,6 +341,16 @@ class GPU:
         }
         processes = self.processes() or []
         data.update({'process_mem_{0}'.format(p['pid']): p['used_memory'] for p in processes})
+
+        user_mem_data = dict()
+        for p in processes:
+            dim_name = 'user_mem_{0}'.format(p['user'])
+            if dim_name in user_mem_data:
+                user_mem_data[dim_name] += p['used_memory']
+            else:
+                user_mem_data[dim_name] = p['used_memory']
+
+        data.update(user_mem_data)
 
         return dict(
             ('gpu{0}_{1}'.format(self.num, k), v) for k, v in data.items() if v is not None and v != BAD_VALUE
@@ -364,21 +384,41 @@ class Service(SimpleService):
         for idx, root in enumerate(parsed.findall('gpu')):
             gpu = GPU(idx, root)
             data.update(gpu.data())
-            self.update_processes_mem_chart(gpu)
+            ps = gpu.processes()
+            if ps:
+                self.update_processes_mem_chart(gpu, ps)
+                self.update_users_mem_chart(gpu, ps)
 
         return data or None
+    
+    def update_users_mem_chart(self, gpu, processes):
+        chart_id = 'gpu{0}_{1}'.format(gpu.num, USERS_MEM)
+        active_dims = [
+            [
+                'gpu{0}_user_mem_{1}'.format(gpu.num, p['user']), # id
+                p['user'], # name
+            ] for p in processes
+        ]
+        self.update_chart(chart_id, active_dims)
+    
+    def update_processes_mem_chart(self, gpu, processes):
+        chart_id = 'gpu{0}_{1}'.format(gpu.num, PROCESSES_MEM)
+        active_dims = [
+            [
+                'gpu{0}_process_mem_{1}'.format(gpu.num, p['pid']), # id
+                '{0} {1}'.format(p['pid'], p['process_name']), # name
+            ] for p in processes
+        ]
+        self.update_chart(chart_id, active_dims)
 
-    def update_processes_mem_chart(self, gpu):
-        ps = gpu.processes()
-        if not ps:
-            return
-        chart = self.charts['gpu{0}_{1}'.format(gpu.num, PROCESSES_MEM)]
+    def update_chart(self, chart_id, active_dims):
+        chart = self.charts[chart_id]
         active_dim_ids = []
-        for p in ps:
-            dim_id = 'gpu{0}_process_mem_{1}'.format(gpu.num, p['pid'])
+        for d in active_dims:
+            dim_id = d[0]
             active_dim_ids.append(dim_id)
             if dim_id not in chart:
-                chart.add_dimension([dim_id, '{0} {1}'.format(p['pid'], p['process_name'])])
+                chart.add_dimension(d)
         for dim in chart:
             if dim.id not in active_dim_ids:
                 chart.del_dimension(dim.id, hide=False)
